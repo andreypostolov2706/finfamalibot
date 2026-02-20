@@ -1,0 +1,16 @@
+# Секретные файлы
+.env
+.env.local
+*.env
+
+# Кэш Python
+__pycache__/
+*.pyc
+
+# Базы данных
+*.db
+*.sqlite3
+
+# Логи
+logs/
+*.log
