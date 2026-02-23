@@ -28,7 +28,8 @@ def init_db():
     try:
         # Создание общего семейного бюджета (если не существует)
         if session.query(FamilyBudget).count() == 0:
-            family_budget = FamilyBudget(balance=0.0)
+            # Инициализация с разделением на карту и наличные
+            family_budget = FamilyBudget(card_balance=0.0, cash_balance=0.0, balance=0.0)
             session.add(family_budget)
             session.commit()
         

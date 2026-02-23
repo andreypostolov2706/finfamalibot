@@ -4,7 +4,7 @@
 from aiogram import Router, F
 from aiogram.types import CallbackQuery
 from aiogram.fsm.context import FSMContext
-from database import get_session, User, BusinessAccount, FixedPayment, PiggyBank, Operation, OperationItem, Category
+from database import get_session, User, BusinessAccount, FixedPayment, FixedPaymentDue, PiggyBank, Operation, OperationItem, Category, FamilyBudget
 from keyboards.main_menu import get_main_menu, get_business_menu, get_credits_menu, get_piggy_menu
 from handlers.family_budget import get_dashboard
 
@@ -45,17 +45,27 @@ async def callback_family_income(callback: CallbackQuery, state: FSMContext):
     from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
     
     await state.set_state(FamilyBudgetStates.waiting_for_income)
-    
+
     keyboard = [
         [InlineKeyboardButton(text="❌ Отмена", callback_data="menu_main")]
     ]
-    
-    await callback.message.answer(
-        "💵 Введите доход в семейный бюджет:\n\n"
-        "Например: '5000 доставка'\n"
-        "или просто: '5000'",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard)
-    )
+
+    # Редактируем текущее сообщение, чтобы сохранить контекст меню
+    try:
+        await callback.message.edit_text(
+            "💵 Введите доход в семейный бюджет:\n\n"
+            "Например: '5000 доставка'\n"
+            "или просто: '5000'",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard)
+        )
+    except Exception:
+        # Фоллбек — если редактирование не удалось, отправим новое сообщение
+        await callback.message.answer(
+            "💵 Введите доход в семейный бюджет:\n\n"
+            "Например: '5000 доставка'\n"
+            "или просто: '5000'",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard)
+        )
     await callback.answer()
 
 
@@ -1202,20 +1212,48 @@ async def delete_operation(callback: CallbackQuery, state: FSMContext):
     session = get_session()
     try:
         operation = session.query(Operation).get(operation_id)
-        
         if not operation:
             await callback.answer("Операция не найдена", show_alert=True)
             return
-        
+
+        # --- PATCH: Rollback balances and payment status if this is a payment operation ---
+        # Check if this operation is a payment for FixedPaymentDue
+        # Heuristic: operation.type == 'family_expense' and only one item, and item name matches FixedPayment
+        if operation.type == 'family_expense' and len(operation.items) == 1:
+            item = operation.items[0]
+            # Try to find a FixedPayment with this name
+            fp = session.query(FixedPayment).filter_by(name=item.name).first()
+            if fp:
+                # Find the due for this payment in the same month/year as operation
+                op_date = operation.created_at
+                due = session.query(FixedPaymentDue).filter_by(fixed_payment_id=fp.id, year=op_date.year, month=op_date.month).first()
+                if due and due.is_paid:
+                    # Rollback paid_amount and status
+                    due.paid_amount = max(0.0, (due.paid_amount or 0.0) - item.amount)
+                    if due.paid_amount < due.due_amount:
+                        due.is_paid = False
+                        due.paid_at = None
+
+                # Rollback FamilyBudget balance (card/cash)
+                fb = session.query(FamilyBudget).first()
+                if fb:
+                    # Heuristic: if paid_account_id is None, it was card/cash, otherwise business
+                    # Try to guess from operation created_at and due.paid_account_id
+                    # For now, return to card_balance by default
+                    fb.card_balance = (fb.card_balance or 0.0) + item.amount
+                    fb.balance = (fb.card_balance or 0.0) + (fb.cash_balance or 0.0)
+
+        # --- END PATCH ---
+
         # Удаление операции (каскадно удалятся и items)
         session.delete(operation)
         session.commit()
-        
+
         await callback.answer("✅ Операция удалена", show_alert=True)
-        
+
         # Возврат к списку операций
         await callback_operations_menu(callback, state)
-        
+
     finally:
         session.close()
 
@@ -1235,9 +1273,50 @@ async def callback_business_menu(callback: CallbackQuery, state: FSMContext):
             await callback.answer()
             return
         
+        # Расчёты по месяцу
+        from sqlalchemy import func
+        from datetime import datetime
+        current_month = datetime.now().month
+        current_year = datetime.now().year
+
+        # Сумма доходов и расходов бизнеса за текущий месяц
+        monthly_income = session.query(func.sum(Operation.total_amount)).filter(
+            Operation.user_id == user.id,
+            Operation.type == 'business_income',
+            func.strftime('%m', Operation.created_at) == f'{current_month:02d}',
+            func.strftime('%Y', Operation.created_at) == str(current_year)
+        ).scalar() or 0.0
+
+        monthly_expense = session.query(func.sum(Operation.total_amount)).filter(
+            Operation.user_id == user.id,
+            Operation.type == 'business_expense',
+            func.strftime('%m', Operation.created_at) == f'{current_month:02d}',
+            func.strftime('%Y', Operation.created_at) == str(current_year)
+        ).scalar() or 0.0
+
+        # Распределение по категориям (топ 5)
+        cat_breakdown = session.query(
+            Category.name,
+            func.sum(OperationItem.amount).label('total')
+        ).join(OperationItem, Category.id == OperationItem.category_id).join(
+            Operation, OperationItem.operation_id == Operation.id
+        ).filter(
+            Operation.user_id == user.id,
+            Operation.type.in_(['business_income', 'business_expense']),
+            func.strftime('%m', Operation.created_at) == f'{current_month:02d}',
+            func.strftime('%Y', Operation.created_at) == str(current_year)
+        ).group_by(Category.id).order_by(func.sum(OperationItem.amount).desc()).limit(5).all()
+
         text = f"💼 Ваш бизнес: {business_account.name}\n\n"
         text += f"💵 Баланс: {business_account.balance:,.2f} ₽\n\n"
         text += "─────────────\n"
+        text += f"Доход: +{monthly_income:,.2f} ₽\n"
+        text += f"Расход: -{monthly_expense:,.2f} ₽\n\n"
+        if cat_breakdown:
+            text += "📊 Топ категорий (за месяц):\n"
+            for name, total in cat_breakdown:
+                text += f"• {name}: {total:,.2f} ₽\n"
+            text += "\n"
         text += "Выберите действие:"
         
         await callback.message.edit_text(text, reply_markup=get_business_menu())
@@ -1308,12 +1387,143 @@ async def view_credit(callback: CallbackQuery, state: FSMContext):
             [InlineKeyboardButton(text="✏️ Изменить название", callback_data=f"cedit_name_{credit.id}")],
             [InlineKeyboardButton(text="✏️ Изменить день оплаты", callback_data=f"cedit_day_{credit.id}")],
             [InlineKeyboardButton(text="🗑️ Удалить", callback_data=f"cdel_{credit.id}")],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu_credits")]
+            [InlineKeyboardButton(text="💸 Оплатить", callback_data=f"pay_fp_{credit.id}")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu_credits"), InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu_main")]
         ]
         
         await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
         await callback.answer()
         
+    finally:
+        session.close()
+
+
+
+@router.callback_query(F.data.regexp(r'^pay_fp_\d+$'))
+async def callback_pay_fixed_payment(callback: CallbackQuery, state: FSMContext):
+    """Начало потока оплаты: выбор способа (карта/наличные)"""
+    try:
+        fp_id = int(callback.data.split("_")[2])
+    except (ValueError, IndexError):
+        await callback.answer()
+        return
+
+    session = get_session()
+    try:
+        fp = session.query(FixedPayment).get(fp_id)
+        if not fp:
+            await callback.answer("Платёж не найден", show_alert=True)
+            return
+
+        # Найдём или создадим начисление для текущего месяца
+        from datetime import datetime
+        now = datetime.now()
+        due = session.query(FixedPaymentDue).filter_by(fixed_payment_id=fp.id, year=now.year, month=now.month).first()
+        if not due:
+            due = FixedPaymentDue(
+                fixed_payment_id=fp.id,
+                year=now.year,
+                month=now.month,
+                due_amount=fp.amount,
+                paid_amount=0.0,
+                is_paid=False,
+                skipped=False
+            )
+            session.add(due)
+            session.commit()
+
+        remaining = max(0.0, due.due_amount - (due.paid_amount or 0.0))
+
+        from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Картой", callback_data=f"pay_method_card_{due.id}")],
+            [InlineKeyboardButton(text="Наличными", callback_data=f"pay_method_cash_{due.id}")],
+            [InlineKeyboardButton(text="Отмена", callback_data="menu_credits")],
+            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu_main")]
+        ])
+
+        await callback.message.edit_text(
+            f"Оплата: {fp.name}\nСумма к оплате: {remaining:,.2f} ₽\nВыберите способ оплаты:",
+            reply_markup=kb
+        )
+        await callback.answer()
+    finally:
+        session.close()
+
+
+@router.callback_query(F.data.regexp(r'^pay_method_(card|cash)_\d+$'))
+async def callback_pay_method_selected(callback: CallbackQuery, state: FSMContext):
+    """Обработка выбора способа оплаты — отмечаем начисление как оплаченное (полностью)"""
+    parts = callback.data.split("_")
+    if len(parts) < 3:
+        await callback.answer()
+        return
+    method = parts[2]
+    try:
+        due_id = int(parts[3])
+    except (ValueError, IndexError):
+        await callback.answer()
+        return
+
+    session = get_session()
+    try:
+        due = session.query(FixedPaymentDue).get(due_id)
+        if not due:
+            await callback.answer("Начисление не найдено", show_alert=True)
+            return
+        fp = session.query(FixedPayment).get(due.fixed_payment_id)
+
+        # Полная оплата
+        amount = max(0.0, due.due_amount - (due.paid_amount or 0.0))
+        if amount <= 0:
+            await callback.answer("Уже оплачено", show_alert=True)
+            return
+
+        # Создадим операцию расхода
+        # Для user_id используем первый доступный user (или 1)
+        from sqlalchemy import text
+        user_row = session.execute(text("SELECT id FROM users LIMIT 1")).fetchone()
+        user_id = user_row[0] if user_row else 1
+
+        operation = Operation(user_id=user_id, type='family_expense', total_amount=amount)
+        session.add(operation)
+        session.flush()
+
+        item = OperationItem(operation_id=operation.id, name=fp.name, amount=amount, category_id=getattr(fp, 'category_id', None))
+        session.add(item)
+
+        paid_account_id = None
+        if method == 'card':
+            # если есть default_account_id у платежа — используем его
+            if getattr(fp, 'default_account_id', None):
+                acc = session.query(BusinessAccount).get(fp.default_account_id)
+                if acc:
+                    acc.balance -= amount
+                    paid_account_id = acc.id
+            else:
+                # иначе списываем с семейного баланса
+                fb = session.query(FamilyBudget).first()
+                if fb:
+                    fb.balance -= amount
+        else:
+            # наличные — ничего не меняем
+            paid_account_id = None
+
+        due.paid_amount = (due.paid_amount or 0.0) + amount
+        due.paid_account_id = paid_account_id
+        due.is_paid = True
+        from datetime import datetime
+        due.paid_at = datetime.now()
+
+        session.commit()
+
+        from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+        nav_kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu_credits"), InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu_main")]
+        ])
+
+        await callback.message.edit_text(f"✅ Платёж {fp.name} оплачен на {amount:,.2f} ₽ ({'картой' if method=='card' else 'наличными'})", reply_markup=nav_kb)
+        await callback.answer()
     finally:
         session.close()
 

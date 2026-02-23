@@ -62,12 +62,26 @@ async def save_new_amount(message: types.Message, state: FSMContext):
             
             if operation.type == 'family_expense':
                 if family_budget:
-                    family_budget.balance += old_amount
-                    family_budget.balance -= new_amount
+                    # Возвращаем старую сумму на карту
+                    family_budget.card_balance = (family_budget.card_balance or 0.0) + old_amount
+                    # Списываем новую сумму (с карты затем наличные)
+                    remaining = new_amount
+                    if (family_budget.card_balance or 0.0) >= remaining:
+                        family_budget.card_balance -= remaining
+                        remaining = 0.0
+                    else:
+                        remaining -= (family_budget.card_balance or 0.0)
+                        family_budget.card_balance = 0.0
+                    if remaining > 0:
+                        family_budget.cash_balance = (family_budget.cash_balance or 0.0) - remaining
+                        remaining = 0.0
+                    family_budget.balance = (family_budget.card_balance or 0.0) + (family_budget.cash_balance or 0.0)
             elif operation.type == 'family_income':
                 if family_budget:
-                    family_budget.balance -= old_amount
-                    family_budget.balance += new_amount
+                    # Уменьшаем старую сумму и увеличиваем новую — операции на карте
+                    family_budget.card_balance = (family_budget.card_balance or 0.0) - old_amount
+                    family_budget.card_balance = (family_budget.card_balance or 0.0) + new_amount
+                    family_budget.balance = (family_budget.card_balance or 0.0) + (family_budget.cash_balance or 0.0)
             elif operation.type == 'business_income':
                 business = session.query(BusinessAccount).filter_by(user_id=user.id).first()
                 if business:
@@ -84,13 +98,23 @@ async def save_new_amount(message: types.Message, state: FSMContext):
                 
                 business.balance += old_amount
                 if family_budget:
-                    family_budget.balance -= old_amount * 0.9
+                    # Списываем часть на семью (уменьшаем карту сначала)
+                    remaining_old = old_amount * 0.9
+                    if (family_budget.card_balance or 0.0) >= remaining_old:
+                        family_budget.card_balance -= remaining_old
+                    else:
+                        remaining_old -= (family_budget.card_balance or 0.0)
+                        family_budget.card_balance = 0.0
+                        family_budget.cash_balance = (family_budget.cash_balance or 0.0) - remaining_old
+                    family_budget.balance = (family_budget.card_balance or 0.0) + (family_budget.cash_balance or 0.0)
                 if piggy:
                     piggy.balance -= old_amount * 0.1
                 
                 business.balance -= new_amount
                 if family_budget:
-                    family_budget.balance += new_amount * 0.9
+                    # Закидываем новую сумму на карту
+                    family_budget.card_balance = (family_budget.card_balance or 0.0) + new_amount * 0.9
+                    family_budget.balance = (family_budget.card_balance or 0.0) + (family_budget.cash_balance or 0.0)
                 if piggy:
                     piggy.balance += new_amount * 0.1
             

@@ -14,7 +14,11 @@ class FamilyBudget(Base):
     __tablename__ = 'family_budget'
     
     id = Column(Integer, primary_key=True, autoincrement=True)
+    # Старое поле `balance` сохраняем для совместимости, но вводим разделение:
+    # `card_balance` — средства на карте, `cash_balance` — наличные
     balance = Column(Float, default=0.0)
+    card_balance = Column(Float, default=0.0)
+    cash_balance = Column(Float, default=0.0)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
@@ -55,6 +59,7 @@ class Operation(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     user_id = Column(Integer, ForeignKey('users.id'), nullable=False)
     type = Column(String(50), nullable=False)  # family_expense, business_income, business_expense, salary, piggy_deposit, piggy_withdraw
+    account_type = Column(String(20), nullable=True)  # 'card', 'cash', 'business', 'mixed' - for family ops
     total_amount = Column(Float, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
     
@@ -118,7 +123,30 @@ class FixedPayment(Base):
     amount = Column(Float, nullable=False)
     payment_day = Column(Integer, nullable=False)  # День месяца (1-31)
     is_active = Column(Boolean, default=True)
+    # Опционный счёт по умолчанию (BusinessAccount.id) и категория
+    default_account_id = Column(Integer, ForeignKey('business_accounts.id'), nullable=True)
+    category_id = Column(Integer, ForeignKey('categories.id'), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class FixedPaymentDue(Base):
+    """Начисление фиксированного платежа на конкретный месяц"""
+    __tablename__ = 'fixed_payment_dues'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    fixed_payment_id = Column(Integer, ForeignKey('fixed_payments.id'), nullable=False)
+    year = Column(Integer, nullable=False)
+    month = Column(Integer, nullable=False)
+    due_amount = Column(Float, nullable=False)
+    paid_amount = Column(Float, default=0.0)
+    is_paid = Column(Boolean, default=False)
+    skipped = Column(Boolean, default=False)
+    paid_at = Column(DateTime, nullable=True)
+    paid_account_id = Column(Integer, ForeignKey('business_accounts.id'), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    # Relationships
+    fixed_payment = relationship('FixedPayment')
 
 
 class Debt(Base):

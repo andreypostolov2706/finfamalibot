@@ -183,22 +183,33 @@ async def deposit_piggy_save(message: types.Message, state: FSMContext):
             # Получение общего семейного бюджета
             family_budget = session.query(FamilyBudget).first()
             if not family_budget:
-                family_budget = FamilyBudget(balance=0.0)
+                family_budget = FamilyBudget(balance=0.0, card_balance=0.0, cash_balance=0.0)
                 session.add(family_budget)
-            
+
+            family_total = (family_budget.card_balance or 0.0) + (family_budget.cash_balance or 0.0)
             # Проверка баланса семейного бюджета
-            if family_budget.balance < amount:
+            if family_total < amount:
                 await message.answer(
                     f"❌ Недостаточно средств в семейном бюджете!\n\n"
-                    f"Доступно: {family_budget.balance:,.2f} ₽\n"
+                    f"Доступно: {family_total:,.2f} ₽\n"
                     f"Требуется: {amount:,.2f} ₽\n\n"
                     f"Выдайте зарплату из бизнеса для пополнения семейного бюджета."
                 )
                 await state.clear()
                 return
-            
-            # Списание из общего семейного бюджета
-            family_budget.balance -= amount
+
+            # Списание из семейного бюджета: сначала с карты, потом наличные
+            remaining = amount
+            if (family_budget.card_balance or 0.0) >= remaining:
+                family_budget.card_balance -= remaining
+                remaining = 0.0
+            else:
+                remaining -= (family_budget.card_balance or 0.0)
+                family_budget.card_balance = 0.0
+            if remaining > 0:
+                family_budget.cash_balance = (family_budget.cash_balance or 0.0) - remaining
+                remaining = 0.0
+            family_budget.balance = (family_budget.card_balance or 0.0) + (family_budget.cash_balance or 0.0)
             
             # Пополнение копилки
             piggy.balance += amount
@@ -210,7 +221,7 @@ async def deposit_piggy_save(message: types.Message, state: FSMContext):
                 f"Пополнение: +{amount:,.2f} ₽\n"
                 f"Баланс копилки: {piggy.balance:,.2f} ₽\n\n"
                 f"👨‍👩‍👧 Семейный бюджет\n"
-                f"Остаток: {family_budget.balance:,.2f} ₽",
+                f"Остаток: {family_budget.balance:,.2f} ₽ (Карта: {family_budget.card_balance:,.2f} ₽, Наличные: {family_budget.cash_balance:,.2f} ₽)",
                 reply_markup=get_piggy_menu()
             )
             await state.clear()
@@ -320,9 +331,11 @@ async def withdraw_piggy_save(message: types.Message, state: FSMContext):
             # Возврат в общий семейный бюджет
             family_budget = session.query(FamilyBudget).first()
             if not family_budget:
-                family_budget = FamilyBudget(balance=0.0)
+                family_budget = FamilyBudget(balance=0.0, card_balance=0.0, cash_balance=0.0)
                 session.add(family_budget)
-            family_budget.balance += amount
+            # Возврат в семейный бюджет — зачисляем на карту по умолчанию
+            family_budget.card_balance = (family_budget.card_balance or 0.0) + amount
+            family_budget.balance = (family_budget.card_balance or 0.0) + (family_budget.cash_balance or 0.0)
             session.commit()
             
             await message.answer(
