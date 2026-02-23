@@ -351,6 +351,21 @@ async def confirm_receipt(callback: types.CallbackQuery, state: FSMContext):
         
         if budget_type == "family":
             # Проверка баланса семейного бюджета (карта + наличные)
+            # If account was not chosen yet, ask the user
+            account_from_state = data.get('account_type')
+            if not account_from_state:
+                # Save current confirmation data and ask which account to use
+                await state.update_data(items=items, receipt_corrected_total=corrected_total, budget_type=budget_type, categories_data=data.get('categories_data'))
+                kb = InlineKeyboardMarkup(inline_keyboard=[
+                    [
+                        InlineKeyboardButton(text="💳 Картой", callback_data="receipt_confirm_account_card"),
+                        InlineKeyboardButton(text="💵 Наличными", callback_data="receipt_confirm_account_cash")
+                    ]
+                ])
+                await callback.message.edit_text("Выберите счёт для списания по чеку:", reply_markup=kb)
+                await state.set_state(ReceiptStates.waiting_for_account_choice)
+                await callback.answer()
+                return
             family_budget = session.query(FamilyBudget).first()
             if not family_budget:
                 family_budget = FamilyBudget(balance=0.0, card_balance=0.0, cash_balance=0.0)
@@ -370,15 +385,19 @@ async def confirm_receipt(callback: types.CallbackQuery, state: FSMContext):
             
             # Создание операции
             # Определим, с какого счёта списаны средства (карта/наличные/смешанно)
-            card_bal = (family_budget.card_balance or 0.0)
-            cash_bal = (family_budget.cash_balance or 0.0)
             account_used = None
-            if card_bal >= total_amount:
-                account_used = 'card'
-            elif cash_bal >= total_amount:
-                account_used = 'cash'
+            # Если пользователь заранее выбрал счёт — используем его
+            if account_from_state in ('card', 'cash'):
+                account_used = account_from_state
             else:
-                account_used = 'mixed'
+                card_bal = (family_budget.card_balance or 0.0)
+                cash_bal = (family_budget.cash_balance or 0.0)
+                if card_bal >= total_amount:
+                    account_used = 'card'
+                elif cash_bal >= total_amount:
+                    account_used = 'cash'
+                else:
+                    account_used = 'mixed'
 
             operation = Operation(
                 user_id=user.id,
@@ -408,17 +427,20 @@ async def confirm_receipt(callback: types.CallbackQuery, state: FSMContext):
                 )
                 session.add(op_item)
             
-            # Списание из семейного бюджета: сначала с карты, потом наличные
+            # Списание из семейного бюджета: используем определённый счёт
             remaining = total_amount
-            if (family_budget.card_balance or 0.0) >= remaining:
+            if account_used == 'card':
                 family_budget.card_balance -= remaining
-                remaining = 0.0
-            else:
-                remaining -= (family_budget.card_balance or 0.0)
-                family_budget.card_balance = 0.0
-            if remaining > 0:
-                family_budget.cash_balance = (family_budget.cash_balance or 0.0) - remaining
-                remaining = 0.0
+            elif account_used == 'cash':
+                family_budget.cash_balance -= remaining
+            else:  # mixed
+                if (family_budget.card_balance or 0.0) >= remaining:
+                    family_budget.card_balance -= remaining
+                else:
+                    remaining -= (family_budget.card_balance or 0.0)
+                    family_budget.card_balance = 0.0
+                    if remaining > 0:
+                        family_budget.cash_balance = (family_budget.cash_balance or 0.0) - remaining
             # Обновляем суммарное поле balance для совместимости
             family_budget.balance = (family_budget.card_balance or 0.0) + (family_budget.cash_balance or 0.0)
             session.commit()
@@ -493,5 +515,110 @@ async def confirm_receipt(callback: types.CallbackQuery, state: FSMContext):
         await state.clear()
         await callback.answer()
         
+    finally:
+        session.close()
+
+
+
+@router.callback_query(F.data.in_({"receipt_confirm_account_card", "receipt_confirm_account_cash"}))
+async def process_receipt_confirm_account(callback: types.CallbackQuery, state: FSMContext):
+    """Finalize receipt confirmation when user selects account."""
+    current_state = await state.get_state()
+    if current_state != ReceiptStates.waiting_for_account_choice:
+        await callback.answer()
+        return
+
+    data = await state.get_data()
+    items = data.get('items', [])
+    corrected_total = data.get('receipt_corrected_total')
+    session = get_session()
+    try:
+        user = session.query(User).filter_by(telegram_id=callback.from_user.id).first()
+        total_amount = corrected_total if corrected_total else sum(item.get('amount', 0) for item in items)
+
+        family_budget = session.query(FamilyBudget).first()
+        if not family_budget:
+            family_budget = FamilyBudget(balance=0.0, card_balance=0.0, cash_balance=0.0)
+            session.add(family_budget)
+            session.flush()
+
+        # Prepare adjusted items same as in confirm_receipt
+        adjusted_items = []
+        if items:
+            orig_sum = sum(float(item.get('amount', 0) or 0.0) for item in items)
+            if corrected_total and orig_sum > 0:
+                for it in items:
+                    adjusted_items.append({**it, '_adjusted_amount': float(it.get('amount', 0) or 0.0)})
+            elif corrected_total and orig_sum == 0:
+                per = round(float(total_amount) / len(items), 2)
+                running = 0.0
+                for it in items:
+                    adjusted_items.append({**it, '_adjusted_amount': per})
+                    running += per
+                diff = round(float(total_amount) - running, 2)
+                if adjusted_items:
+                    adjusted_items[-1]['_adjusted_amount'] = round(adjusted_items[-1]['_adjusted_amount'] + diff, 2)
+            else:
+                for it in items:
+                    adjusted_items.append({**it, '_adjusted_amount': float(it.get('amount', 0) or 0.0)})
+
+        # Determine selected account
+        selected = 'card' if callback.data == 'receipt_confirm_account_card' else 'cash'
+
+        # Check funds on selected account (require full amount on chosen account)
+        if selected == 'card' and (family_budget.card_balance or 0.0) < total_amount:
+            await callback.message.edit_text(f"❌ Недостаточно средств на карте!\n\nДоступно: {family_budget.card_balance:,.2f} ₽\nТребуется: {total_amount:,.2f} ₽")
+            await state.clear()
+            await callback.answer()
+            return
+        if selected == 'cash' and (family_budget.cash_balance or 0.0) < total_amount:
+            await callback.message.edit_text(f"❌ Недостаточно наличных!\n\nДоступно: {family_budget.cash_balance:,.2f} ₽\nТребуется: {total_amount:,.2f} ₽")
+            await state.clear()
+            await callback.answer()
+            return
+
+        # Create operation
+        operation = Operation(
+            user_id=user.id,
+            type='family_expense',
+            total_amount=total_amount,
+            account_type=selected
+        )
+        session.add(operation)
+        session.flush()
+
+        for item_data in adjusted_items:
+            category = None
+            if item_data.get('category'):
+                category = session.query(Category).filter_by(name=item_data['category'], parent_id=None).first()
+            amount_to_use = item_data.get('_adjusted_amount', item_data.get('amount', 0))
+            op_item = OperationItem(
+                operation_id=operation.id,
+                name=item_data.get('name', item_data.get('description', 'Без названия')),
+                amount=amount_to_use,
+                category_id=category.id if category else None,
+                subcategory=item_data.get('subcategory')
+            )
+            session.add(op_item)
+
+        # Deduct from selected account
+        if selected == 'card':
+            family_budget.card_balance = (family_budget.card_balance or 0.0) - total_amount
+        else:
+            family_budget.cash_balance = (family_budget.cash_balance or 0.0) - total_amount
+        family_budget.balance = (family_budget.card_balance or 0.0) + (family_budget.cash_balance or 0.0)
+        session.commit()
+
+        response = f"✅ Чек добавлен в семейный бюджет!\n\n"
+        response += f"Позиций: {len(adjusted_items)}\n"
+        response += f"Итого: -{total_amount:,.2f} ₽\n\n"
+        response += f"👨‍👩‍👧 Семейный бюджет\n"
+        response += f"Остаток: {family_budget.balance:,.2f} ₽ (Карта: {family_budget.card_balance:,.2f} ₽, Наличные: {family_budget.cash_balance:,.2f} ₽)"
+
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu_main")]])
+        await callback.message.edit_text(response, reply_markup=keyboard)
+        await state.clear()
+        await callback.answer()
+
     finally:
         session.close()

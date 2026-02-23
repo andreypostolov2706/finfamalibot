@@ -1216,34 +1216,99 @@ async def delete_operation(callback: CallbackQuery, state: FSMContext):
             await callback.answer("Операция не найдена", show_alert=True)
             return
 
-        # --- PATCH: Rollback balances and payment status if this is a payment operation ---
-        # Check if this operation is a payment for FixedPaymentDue
-        # Heuristic: operation.type == 'family_expense' and only one item, and item name matches FixedPayment
-        if operation.type == 'family_expense' and len(operation.items) == 1:
-            item = operation.items[0]
-            # Try to find a FixedPayment with this name
-            fp = session.query(FixedPayment).filter_by(name=item.name).first()
-            if fp:
-                # Find the due for this payment in the same month/year as operation
-                op_date = operation.created_at
-                due = session.query(FixedPaymentDue).filter_by(fixed_payment_id=fp.id, year=op_date.year, month=op_date.month).first()
-                if due and due.is_paid:
-                    # Rollback paid_amount and status
-                    due.paid_amount = max(0.0, (due.paid_amount or 0.0) - item.amount)
-                    if due.paid_amount < due.due_amount:
-                        due.is_paid = False
-                        due.paid_at = None
+        # Rollback balances and related entities according to operation type
+        try:
+            total = operation.total_amount or sum((it.amount or 0.0) for it in operation.items)
+        except Exception:
+            total = 0.0
 
-                # Rollback FamilyBudget balance (card/cash)
-                fb = session.query(FamilyBudget).first()
-                if fb:
-                    # Heuristic: if paid_account_id is None, it was card/cash, otherwise business
-                    # Try to guess from operation created_at and due.paid_account_id
-                    # For now, return to card_balance by default
-                    fb.card_balance = (fb.card_balance or 0.0) + item.amount
-                    fb.balance = (fb.card_balance or 0.0) + (fb.cash_balance or 0.0)
+        # Helper to get family budget
+        fb = session.query(FamilyBudget).first()
 
-        # --- END PATCH ---
+        # Family expense: return money back to the chosen account
+        if operation.type == 'family_expense':
+            acct = (operation.account_type or '').lower()
+            if fb:
+                if acct == 'cash':
+                    fb.cash_balance = (fb.cash_balance or 0.0) + total
+                else:
+                    # default to card if unknown
+                    fb.card_balance = (fb.card_balance or 0.0) + total
+                fb.balance = (fb.card_balance or 0.0) + (fb.cash_balance or 0.0)
+
+            # If this expense corresponded to a FixedPaymentDue, rollback its paid status
+            if len(operation.items) == 1:
+                item = operation.items[0]
+                fp = session.query(FixedPayment).filter_by(name=item.name).first()
+                if fp:
+                    op_date = operation.created_at
+                    due = session.query(FixedPaymentDue).filter_by(fixed_payment_id=fp.id, year=op_date.year, month=op_date.month).first()
+                    if due and due.is_paid:
+                        due.paid_amount = max(0.0, (due.paid_amount or 0.0) - (item.amount or 0.0))
+                        if (due.paid_amount or 0.0) < due.due_amount:
+                            due.is_paid = False
+                            due.paid_at = None
+
+        # Family income: remove money that was previously added
+        elif operation.type == 'family_income':
+            acct = (operation.account_type or '').lower()
+            if fb:
+                if acct == 'cash':
+                    fb.cash_balance = (fb.cash_balance or 0.0) - total
+                else:
+                    fb.card_balance = (fb.card_balance or 0.0) - total
+                fb.balance = (fb.card_balance or 0.0) + (fb.cash_balance or 0.0)
+
+        # Salary: reverse business -> family transfer and piggy deposit
+        elif operation.type == 'salary':
+            # business account belonged to operation.user_id
+            business_account = session.query(BusinessAccount).filter_by(user_id=operation.user_id).first()
+            if business_account:
+                business_account.balance = (business_account.balance or 0.0) + total
+
+            # Reverse family 90% and piggy 10%
+            family_amount = (total or 0.0) * 0.9
+            piggy_amount = (total or 0.0) * 0.1
+            acct = (operation.account_type or '').lower()
+            if fb:
+                if acct == 'cash':
+                    fb.cash_balance = (fb.cash_balance or 0.0) - family_amount
+                else:
+                    fb.card_balance = (fb.card_balance or 0.0) - family_amount
+                fb.balance = (fb.card_balance or 0.0) + (fb.cash_balance or 0.0)
+
+            piggy = session.query(PiggyBank).filter_by(is_auto=True).first()
+            if piggy:
+                piggy.balance = (piggy.balance or 0.0) - piggy_amount
+
+        # Business income/expense: reverse on business account
+        elif operation.type == 'business_income':
+            ba = session.query(BusinessAccount).filter_by(user_id=operation.user_id).first()
+            if ba:
+                ba.balance = (ba.balance or 0.0) - total
+
+        elif operation.type == 'business_expense':
+            ba = session.query(BusinessAccount).filter_by(user_id=operation.user_id).first()
+            if ba:
+                ba.balance = (ba.balance or 0.0) + total
+
+        # Piggy deposit/withdraw
+        elif operation.type == 'piggy_deposit':
+            # deposit had increased piggy; on delete, decrease it
+            piggy = session.query(PiggyBank).first()
+            if piggy:
+                piggy.balance = (piggy.balance or 0.0) - total
+
+        elif operation.type == 'piggy_withdraw':
+            piggy = session.query(PiggyBank).first()
+            if piggy:
+                piggy.balance = (piggy.balance or 0.0) + total
+
+        # Ensure no negative balances where inappropriate
+        if fb:
+            fb.card_balance = max(0.0, fb.card_balance or 0.0)
+            fb.cash_balance = max(0.0, fb.cash_balance or 0.0)
+            fb.balance = (fb.card_balance or 0.0) + (fb.cash_balance or 0.0)
 
         # Удаление операции (каскадно удалятся и items)
         session.delete(operation)

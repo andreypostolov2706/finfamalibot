@@ -89,14 +89,75 @@ async def process_expense_account(callback: types.CallbackQuery, state: FSMConte
     session = get_session()
     try:
         data = await state.get_data()
+        # Support both single-expense flow (expense_amount/expense_description)
+        # and batch flow saved as 'expense_items' + 'expense_total'
         amount = data.get('expense_amount')
         description = data.get('expense_description')
+        batch_items = data.get('expense_items')
+        batch_total = data.get('expense_total')
         user = session.query(User).filter_by(telegram_id=callback.from_user.id).first()
         family_budget = session.query(FamilyBudget).first()
         if not family_budget:
             family_budget = FamilyBudget(balance=0.0, card_balance=0.0, cash_balance=0.0)
             session.add(family_budget)
+        if batch_items:
+            # Batch flow: user provided multiple lines — enforce chosen account has enough funds
+            total = float(batch_total or 0.0)
+            if callback.data == "expense_card":
+                if (family_budget.card_balance or 0.0) < total:
+                    await callback.message.edit_text(
+                        f"❌ Недостаточно средств на карте!\n\n"
+                        f"Доступно: {family_budget.card_balance:,.2f} ₽\n"
+                        f"Требуется: {total:,.2f} ₽"
+                    )
+                    await state.clear()
+                    return
+                family_budget.card_balance -= total
+                account_used = 'card'
+            else:
+                if (family_budget.cash_balance or 0.0) < total:
+                    await callback.message.edit_text(
+                        f"❌ Недостаточно наличных!\n\n"
+                        f"Доступно: {family_budget.cash_balance:,.2f} ₽\n"
+                        f"Требуется: {total:,.2f} ₽"
+                    )
+                    await state.clear()
+                    return
+                family_budget.cash_balance -= total
+                account_used = 'cash'
+
+            operation = Operation(
+                user_id=user.id,
+                type='family_expense',
+                total_amount=total,
+                account_type=account_used
+            )
+            session.add(operation)
+            session.flush()
+            for item in batch_items:
+                op_item = OperationItem(
+                    operation_id=operation.id,
+                    name=item.get('description') or 'Без описания',
+                    amount=item.get('amount')
+                )
+                session.add(op_item)
+            family_budget.balance = (family_budget.card_balance or 0.0) + (family_budget.cash_balance or 0.0)
+            session.commit()
+            response = f"✅ Добавлено {len(batch_items)} позиций в семейный бюджет!\n\n"
+            response += f"Итого: -{total:,.2f} ₽\n\n"
+            response += f"👨‍👩‍👧 Семейный бюджет\n"
+            response += f"Баланс: {family_budget.balance:,.2f} ₽ (Карта: {family_budget.card_balance:,.2f} ₽, Наличные: {family_budget.cash_balance:,.2f} ₽)"
+            keyboard = [[types.InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu_main")]]
+            await callback.message.edit_text(response, reply_markup=types.InlineKeyboardMarkup(inline_keyboard=keyboard))
+            await state.clear()
+            return
+
+        # Single-item flow (existing behavior)
         # Проверка баланса выбранного счёта
+        if amount is None or description is None:
+            await callback.answer()
+            await state.clear()
+            return
         if callback.data == "expense_card":
             if (family_budget.card_balance or 0.0) < amount:
                 await callback.message.edit_text(
@@ -107,6 +168,7 @@ async def process_expense_account(callback: types.CallbackQuery, state: FSMConte
                 await state.clear()
                 return
             family_budget.card_balance -= amount
+            account_used = 'card'
         else:
             if (family_budget.cash_balance or 0.0) < amount:
                 await callback.message.edit_text(
@@ -117,13 +179,14 @@ async def process_expense_account(callback: types.CallbackQuery, state: FSMConte
                 await state.clear()
                 return
             family_budget.cash_balance -= amount
+            account_used = 'cash'
         family_budget.balance = (family_budget.card_balance or 0.0) + (family_budget.cash_balance or 0.0)
         # Создание операции
         operation = Operation(
             user_id=user.id,
             type='family_expense',
             total_amount=amount,
-            account_type='card' if callback.data == 'expense_card' else 'cash'
+            account_type=account_used
         )
         session.add(operation)
         session.flush()
@@ -288,6 +351,32 @@ async def get_dashboard(session, user: User) -> str:
         func.strftime('%m', Operation.created_at) == f'{current_month:02d}',
         func.strftime('%Y', Operation.created_at) == str(current_year)
     ).scalar() or 0.0
+
+    # Расходы по счетам (карта/наличные) за месяц
+    monthly_card_expenses = session.query(func.sum(OperationItem.amount)).join(
+        Operation, Operation.id == OperationItem.operation_id
+    ).filter(
+        Operation.type == 'family_expense',
+        Operation.account_type == 'card',
+        func.strftime('%m', Operation.created_at) == f'{current_month:02d}',
+        func.strftime('%Y', Operation.created_at) == str(current_year)
+    ).scalar() or 0.0
+
+    monthly_cash_expenses = session.query(func.sum(OperationItem.amount)).join(
+        Operation, Operation.id == OperationItem.operation_id
+    ).filter(
+        Operation.type == 'family_expense',
+        Operation.account_type == 'cash',
+        func.strftime('%m', Operation.created_at) == f'{current_month:02d}',
+        func.strftime('%Y', Operation.created_at) == str(current_year)
+    ).scalar() or 0.0
+
+    # Общий доход (зарплаты + семейные доходы) за месяц
+    monthly_total_income = session.query(func.sum(Operation.total_amount)).filter(
+        Operation.type.in_(['salary', 'family_income']),
+        func.strftime('%m', Operation.created_at) == f'{current_month:02d}',
+        func.strftime('%Y', Operation.created_at) == str(current_year)
+    ).scalar() or 0.0
     
     # Зарплаты за месяц (детально)
     salary_ops = session.query(Operation).filter(
@@ -329,8 +418,12 @@ async def get_dashboard(session, user: User) -> str:
     text += "─────────────\n"
     text += f"Баланс: {family_total:,.2f} ₽ (сумма карта и наличные)\n"
     # Показываем текущие балансы и суммы доходов по счетам за месяц
-    text += f"  💳 Карта: {family_budget.card_balance:,.2f} ₽ (доходы: {monthly_card_income:,.2f} ₽)\n"
-    text += f"  💵 Наличные: {family_budget.cash_balance:,.2f} ₽ (доходы: {monthly_cash_income:,.2f} ₽)\n"
+    text += f"  💳 Карта: {family_budget.card_balance:,.2f} ₽\n"
+    text += f"   - доходы: +{monthly_card_income:,.2f} ₽\n"
+    text += f"   - расходы: -{monthly_card_expenses:,.2f} ₽\n"
+    text += f"  💵 Наличные: {family_budget.cash_balance:,.2f} ₽\n"
+    text += f"   - доходы: +{monthly_cash_income:,.2f} ₽\n"
+    text += f"   - расходы: -{monthly_cash_expenses:,.2f} ₽\n"
     
     if monthly_salary > 0:
         text += f"Зачисления:\n"
@@ -349,8 +442,8 @@ async def get_dashboard(session, user: User) -> str:
                     account_type = 'Смешано'
             name = op_user.name if op_user else f'ID {op.user_id}'
             text += f"  • {name} → {account_type}: {op.total_amount:,.2f} ₽\n"
-    if monthly_family_income > 0:
-        text += f"Доход: +{monthly_family_income:,.2f} ₽\n"
+    if monthly_total_income > 0:
+        text += f"Доход: +{monthly_total_income:,.2f} ₽\n"
     text += "\n"
     
     # Платежи — показываем все фиксированные платежи с иконкой статуса для текущего месяца
@@ -552,10 +645,28 @@ async def handle_text_message(message: types.Message, state: FSMContext):
             )
             return
         
-        # Создание одной операции со всеми позициями
+        # Определяем подсказку по счёту (если пользователь указал 'нал'/'карта' в тексте)
+        account_hint = _detect_account_type(message.text)
+        # Если подсказки по счёту нет — спросим у пользователя (карта/наличные)
+        if account_hint is None:
+            # Сохраняем подготовленные позиции и сумму в состояние и запрашиваем счёт
+            await state.update_data(expense_items=items_to_add, expense_total=total_amount)
+            keyboard = [[
+                types.InlineKeyboardButton(text="Карта", callback_data="expense_card"),
+                types.InlineKeyboardButton(text="Наличные", callback_data="expense_cash")
+            ]]
+            await message.answer(
+                "Выберите счёт для списания:",
+                reply_markup=types.InlineKeyboardMarkup(inline_keyboard=keyboard)
+            )
+            await state.set_state(FamilyBudgetStates.waiting_for_expense_account)
+            return
+
+        # Создание одной операции со всеми позициями (есть подсказка по счёту)
         operation = Operation(
             user_id=user.id,
             type='family_expense',
+            account_type=account_hint,
             total_amount=total_amount
         )
         session.add(operation)
@@ -579,17 +690,30 @@ async def handle_text_message(message: types.Message, state: FSMContext):
             )
             session.add(op_item)
         
-        # Списание из семейного бюджета: сначала с карты, затем наличные
+        # Списание из семейного бюджета: порядок списания зависит от подсказки по счёту
         remaining = total_amount
-        if (family_budget.card_balance or 0.0) >= remaining:
-            family_budget.card_balance -= remaining
-            remaining = 0.0
+        if account_hint == 'cash':
+            # Сначала наличные, затем карта
+            if (family_budget.cash_balance or 0.0) >= remaining:
+                family_budget.cash_balance -= remaining
+                remaining = 0.0
+            else:
+                remaining -= (family_budget.cash_balance or 0.0)
+                family_budget.cash_balance = 0.0
+            if remaining > 0:
+                family_budget.card_balance = (family_budget.card_balance or 0.0) - remaining
+                remaining = 0.0
         else:
-            remaining -= (family_budget.card_balance or 0.0)
-            family_budget.card_balance = 0.0
-        if remaining > 0:
-            family_budget.cash_balance = (family_budget.cash_balance or 0.0) - remaining
-            remaining = 0.0
+            # По умолчанию: сначала карта, затем наличные
+            if (family_budget.card_balance or 0.0) >= remaining:
+                family_budget.card_balance -= remaining
+                remaining = 0.0
+            else:
+                remaining -= (family_budget.card_balance or 0.0)
+                family_budget.card_balance = 0.0
+            if remaining > 0:
+                family_budget.cash_balance = (family_budget.cash_balance or 0.0) - remaining
+                remaining = 0.0
         family_budget.balance = (family_budget.card_balance or 0.0) + (family_budget.cash_balance or 0.0)
         session.commit()
         
@@ -717,4 +841,25 @@ def _guess_category(item_name: str, categories_data: list) -> str | None:
                         return cat['name']
                 return cat_name  # Возвращаем даже если нет в БД
     
+    return None
+
+
+def _detect_account_type(text: str) -> str | None:
+    """
+    Detects explicit account hint in the user's text.
+    Returns 'cash' or 'card' or None.
+    """
+    if not text:
+        return None
+    t = text.lower()
+    # cash tokens
+    cash_tokens = ['нал', 'наличка', 'наличные', 'нал.']
+    for tok in cash_tokens:
+        if tok in t:
+            return 'cash'
+    # card tokens
+    card_tokens = ['карта', 'карточка', 'visa', 'mastercard']
+    for tok in card_tokens:
+        if tok in t:
+            return 'card'
     return None
