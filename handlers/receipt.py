@@ -17,6 +17,7 @@ deepseek = DeepSeekService()
 class ReceiptStates(StatesGroup):
     """Состояния для обработки чека"""
     waiting_for_budget_choice = State()  # Выбор бюджета (семья/бизнес)
+    waiting_for_account_choice = State()  # Для семейного бюджета: карта/наличные
     waiting_for_confirmation = State()   # Подтверждение позиций
 
 
@@ -99,10 +100,63 @@ async def process_budget_choice(callback: types.CallbackQuery, state: FSMContext
         await callback.answer()
         return
 
+    # If family budget selected, ask which account (card/cash)
+    if budget_type == 'family':
+        await state.set_state(ReceiptStates.waiting_for_account_choice)
+        # Save file_id in state (already saved earlier, but ensure)
+        await state.update_data(photo_file_id=file_id)
+
+        account_kb = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="💳 Карта", callback_data="receipt_account_card"),
+                InlineKeyboardButton(text="💵 Наличные", callback_data="receipt_account_cash")
+            ],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="menu_main")]
+        ])
+
+        try:
+            await callback.message.edit_text("Выберите счёт для расхода:", reply_markup=account_kb)
+        except Exception:
+            await callback.message.answer("Выберите счёт для расхода:", reply_markup=account_kb)
+
+        await callback.answer()
+        return
+
     await callback.message.edit_text("🤖 Анализирую чек через ИИ...\n\nЭто может занять несколько секунд.")
     await callback.answer()
 
     await _analyze_receipt_and_ask(file_id, budget_type, callback.message, state, bot)
+
+
+@router.callback_query(F.data.in_({"receipt_account_card", "receipt_account_cash"}))
+async def process_account_choice(callback: types.CallbackQuery, state: FSMContext, bot: Bot):
+    """Обработка выбора счёта (карта/наличные) для семейного бюджета"""
+    current_state = await state.get_state()
+    if current_state != ReceiptStates.waiting_for_account_choice:
+        await callback.answer()
+        return
+
+    account_type = 'card' if callback.data == 'receipt_account_card' else 'cash'
+    await state.update_data(account_type=account_type)
+
+    data = await state.get_data()
+    file_id = data.get('photo_file_id')
+    if not file_id:
+        try:
+            await callback.message.edit_text("❌ Файл не найден. Попробуйте снова.")
+        except Exception:
+            await callback.message.answer("❌ Файл не найден. Попробуйте снова.")
+        await state.clear()
+        await callback.answer()
+        return
+
+    try:
+        await callback.message.edit_text("🤖 Анализирую чек через ИИ...\n\nЭто может занять несколько секунд.")
+    except Exception:
+        await callback.message.answer("🤖 Анализирую чек через ИИ...\n\nЭто может занять несколько секунд.")
+
+    await callback.answer()
+    await _analyze_receipt_and_ask(file_id, 'family', callback.message, state, bot)
 
 
 async def _analyze_receipt_and_ask(file_id: str, budget_type: str, message_obj, state: FSMContext, bot: Bot):
@@ -132,6 +186,10 @@ async def _analyze_receipt_and_ask(file_id: str, budget_type: str, message_obj, 
             telegram_file_url = f"https://api.telegram.org/file/bot{cfg.BOT_TOKEN}/{file.file_path}"
 
             # Анализ изображения через DeepSeek (URL + байты как fallback)
+            # If user chose account_type earlier, include it in state data for later processing
+            data = await state.get_data()
+            account_type = data.get('account_type')
+
             items = deepseek.analyze_receipt_image(image_data, categories_data, telegram_file_url)
 
             if not items:
@@ -158,7 +216,8 @@ async def _analyze_receipt_and_ask(file_id: str, budget_type: str, message_obj, 
             await state.update_data(
                 items=items,
                 budget_type=budget_type,
-                categories_data=categories_data
+                categories_data=categories_data,
+                account_type=account_type
             )
             await state.set_state(ReceiptStates.waiting_for_confirmation)
 
